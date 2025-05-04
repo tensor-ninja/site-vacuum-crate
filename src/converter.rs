@@ -11,7 +11,7 @@ pub fn convert_to_markdown(html: &str) -> String {
     markdown
 }
 
-// Clean up the markdown for better readability
+// Clean up the markdown 
 fn clean_markdown(markdown: &str) -> String {
     let mut result = markdown.to_string();
 
