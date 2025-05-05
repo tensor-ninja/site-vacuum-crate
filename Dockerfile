@@ -34,8 +34,6 @@ COPY --from=builder /usr/src/site-vacuum/target/release/site-vacuum /usr/local/b
 
 # Create a script to start chromedriver and the application
 RUN echo '#!/bin/bash\n\
-chromedriver --port=9515 --verbose --whitelisted-ips="" &\n\
-sleep 2\n\
 /usr/local/bin/site-vacuum\n' > /usr/local/bin/start.sh \
     && chmod +x /usr/local/bin/start.sh
 
