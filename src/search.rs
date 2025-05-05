@@ -24,7 +24,6 @@ struct SearchItem {
     link: String,
 }
 
-// Google Search API response structure
 #[derive(Debug, Deserialize)]
 struct GoogleSearchResponse {
     items: Option<Vec<GoogleSearchItem>>,

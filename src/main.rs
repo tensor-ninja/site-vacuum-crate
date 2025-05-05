@@ -1,7 +1,4 @@
 use std::net::SocketAddr;
-use std::path::Path;
-use std::fs::OpenOptions;
-use std::io::Write;
 
 use axum::{
     routing::{get, post},
