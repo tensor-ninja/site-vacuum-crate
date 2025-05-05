@@ -1,250 +1,98 @@
-use anyhow::{Context, Result};
-use futures::stream::{FuturesUnordered, StreamExt};
-use scraper::{Html, Selector};
-use serde::Serialize;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore, broadcast};
-use url::Url;
-use tracing::{info, error, debug};
+use anyhow::Result;
+use spider::website::Website;
+use std::collections::HashMap;
+use scraper;
 
-use crate::converter::convert_to_markdown;
-use crate::fetcher::smart_fetch_url;
-
-#[derive(Debug, Clone, Serialize)]
-pub enum CrawlerEventType {
-    Started,
-    VisitingUrl,
-    UrlProcessed,
-    Completed,
-    Error,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct CrawlerEvent {
-    pub event_type: CrawlerEventType,
-    pub url: String,
-    pub message: Option<String>,
-    pub timestamp: i64,
-}
+use crate::models::SearchResult;
 
 pub struct Crawler {
-    base_url: Url,
-    visited_urls: Arc<Mutex<HashSet<String>>>,
-    content_map: Arc<Mutex<HashMap<String, String>>>,
-    max_concurrent_requests: u32,
-    semaphore: Arc<Semaphore>,
-    enable_js_rendering: bool,
-    event_bus: Arc<broadcast::Sender<CrawlerEvent>>,
+    pub headers: Option<HashMap<String, String>>,
 }
 
+impl Default for Crawler {
+    fn default() -> Self {
+        Self {
+            headers: None,
+        }
+    }
+}
 
 impl Crawler {
-    pub fn new(
-        url: &str, 
-        max_concurrent_requests: u32, 
-        enable_js_rendering: bool,
-        event_bus: Arc<broadcast::Sender<CrawlerEvent>>
-    ) -> Result<Self> {
-        let base_url = Url::parse(url).context("Failed to parse base URL")?;
-        info!("Created crawler for base URL: {}", base_url);
-
-        // Emit started event
-        let start_event = CrawlerEvent {
-            event_type: CrawlerEventType::Started,
-            url: base_url.to_string(),
-            message: Some(format!("Starting crawl for {}", base_url)),
-            timestamp: chrono::Utc::now().timestamp(),
-        };
-        let _ = event_bus.send(start_event);
-
-        Ok(Self {
-            base_url,
-            visited_urls: Arc::new(Mutex::new(HashSet::new())),
-            content_map: Arc::new(Mutex::new(HashMap::new())),
-            max_concurrent_requests,
-            semaphore: Arc::new(Semaphore::new(max_concurrent_requests as usize)),
-            enable_js_rendering,
-            event_bus,
-        })
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub async fn crawl(&self) -> Result<()> {
-        let mut queue = vec![self.base_url.clone()];
-        let mut tasks = FuturesUnordered::new();
+    pub async fn crawl_url(&self, url: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let mut website = Website::new(url).with_depth(limit).build().unwrap();
+
+        website.scrape().await;
         
-        info!("Starting crawl with {} concurrent requests", self.max_concurrent_requests);
-
-        while !queue.is_empty() || !tasks.is_empty() {
-            // Log queue status
-            if !queue.is_empty() {
-                debug!("Queue size: {}, Tasks in progress: {}", queue.len(), tasks.len());
-            }
-            
-            // Fill tasks queue with URLs to process
-            while !queue.is_empty() && tasks.len() < self.max_concurrent_requests as usize {
-                let url = queue.pop().unwrap();
-                let url_str = url.to_string();
-
-                // Skip already visited URLs
-                if self.visited_urls.lock().await.contains(&url_str) {
-                    debug!("Skipping already visited URL: {}", url_str);
-                    continue;
+        if let Some(pages) = website.get_pages() {
+            let results = pages.iter().map(|page| {
+                SearchResult {
+                    title: extract_title(&page.get_html()),
+                    description: extract_description(&page.get_html()),
+                    url: page.get_url_final().to_string(),
+                    content: Some(page.get_html()),
                 }
-
-                // Mark as visited
-                self.visited_urls.lock().await.insert(url_str.clone());
-                info!("Queueing URL for processing: {}", url_str);
-
-                // Emit visiting URL event
-                let visiting_event = CrawlerEvent {
-                    event_type: CrawlerEventType::VisitingUrl,
-                    url: url_str.clone(),
-                    message: Some(format!("Processing URL: {}", url_str)),
-                    timestamp: chrono::Utc::now().timestamp(),
-                };
-                let _ = self.event_bus.send(visiting_event);
-
-                // Clone necessary values for the async task
-                let base_url = self.base_url.clone();
-                let content_map = Arc::clone(&self.content_map);
-                let semaphore = Arc::clone(&self.semaphore);
-                let enable_js_rendering = self.enable_js_rendering;
-                let event_bus = Arc::clone(&self.event_bus);
-
-                tasks.push(async move {
-                    let _permit = semaphore.acquire().await.unwrap();
-                    // Fetch and process URL with JS rendering flag
-                    match Self::process_url(&url, &base_url, &content_map, enable_js_rendering).await {
-                        Ok(new_urls) => {
-                            // Emit URL processed event
-                            let processed_event = CrawlerEvent {
-                                event_type: CrawlerEventType::UrlProcessed,
-                                url: url_str.clone(),
-                                message: Some(format!("Processed URL: {} (found {} links)", url_str, new_urls.len())),
-                                timestamp: chrono::Utc::now().timestamp(),
-                            };
-                            let _ = event_bus.send(processed_event);
-                            (url, new_urls, None)
-                        },
-                        Err(e) => {
-                            // Emit error event
-                            let error_event = CrawlerEvent {
-                                event_type: CrawlerEventType::Error,
-                                url: url_str.clone(),
-                                message: Some(format!("Error processing {}: {}", url_str, e)),
-                                timestamp: chrono::Utc::now().timestamp(),
-                            };
-                            let _ = event_bus.send(error_event);
-                            (url, vec![], Some(e))
-                        }
-                    }
-                });
-            }
-
-            // Process completed tasks
-            if let Some((url, new_urls, error)) = tasks.next().await {
-                if let Some(e) = error {
-                    error!("Error processing {}: {}", url, e);
-                } else {
-                    info!("Processed URL: {} (found {} links)", url, new_urls.len());
-                }
-
-                // Add new URLs to the queue
-                for new_url in new_urls {
-                    let new_url_str = new_url.to_string();
-                    if !self
-                        .visited_urls
-                        .lock()
-                        .await
-                        .contains(&new_url_str)
-                    {
-                        debug!("Discovered new URL: {}", new_url_str);
-                        queue.push(new_url);
-                    }
-                }
-            }
+            }).collect();
+            Ok(results)
+        } else {
+            Ok(Vec::new())
         }
-
-        info!("Crawl completed. Visited {} pages", self.visited_urls.lock().await.len());
-        
-        // Emit completed event
-        let completed_event = CrawlerEvent {
-            event_type: CrawlerEventType::Completed,
-            url: self.base_url.to_string(),
-            message: Some(format!("Crawl completed. Visited {} pages", self.visited_urls.lock().await.len())),
-            timestamp: chrono::Utc::now().timestamp(),
-        };
-        let _ = self.event_bus.send(completed_event);
-        
-        Ok(())
     }
 
-    async fn process_url(
-        url: &Url,
-        base_url: &Url,
-        content_map: &Arc<Mutex<HashMap<String, String>>>,
-        enable_js_rendering: bool,
-    ) -> Result<Vec<Url>> {
-        // Fetch HTML content with JS rendering if enabled
-        let html = smart_fetch_url(url, enable_js_rendering).await?;
-        
-        // Extract links first - before any await points
-        let mut new_urls = Vec::new();
-        {
-            // Parse HTML - in its own scope so it's dropped before any awaits
-            let document = Html::parse_document(&html);
-            
-            // Extract links while document is in scope
-            let link_selector = Selector::parse("a[href]").unwrap();
-            for element in document.select(&link_selector) {
-                if let Some(href) = element.value().attr("href") {
-                    if let Ok(mut new_url) = url.join(href) {
-                        // Only follow URLs with the same domain
-                        if new_url.domain() == base_url.domain() {
-                            // Remove fragment
-                            new_url.set_fragment(None);
-                            // Remove query
-                            new_url.set_query(None);
-                            
-                            new_urls.push(new_url);
-                        }
-                    }
-                }
-            }
+    pub async fn crawl_urls(&self, urls: &[String], limit: usize) -> Result<Vec<SearchResult>> {
+        let mut results = Vec::new();
+        for url in urls {
+            let result = self.crawl_url(url, limit).await?;
+            results.extend(result);
         }
-        
-        // Convert to markdown
-        let markdown = convert_to_markdown(&html);
-        
-        // Save content after link extraction
-        let path = url.path().to_string();
-        content_map.lock().await.insert(path, markdown);
+        Ok(results)
+    }
+}
 
-        Ok(new_urls)
+fn extract_title(html: &str) -> String {
+    if html.is_empty() {
+        return "Unknown Title".to_string();
     }
 
-    pub async fn generate_markdown(&self) -> Result<String> {
-        let content_map = self.content_map.lock().await;
-        let mut markdown = String::new();
+    let document = scraper::Html::parse_document(html);
+    let title_selector = scraper::Selector::parse("title").unwrap();
+    
+    document
+        .select(&title_selector)
+        .next()
+        .and_then(|element| element.text().next())
+        .map(|title| title.trim().to_string())
+        .unwrap_or_else(|| "Unknown Title".to_string())
+}
 
-        // Start with the root URL
-        let root_path = self.base_url.path().to_string();
-        if let Some(content) = content_map.get(&root_path) {
-            markdown.push_str(&format!("# {}\n\n", self.base_url));
-            markdown.push_str(content);
-            markdown.push_str("\n\n");
-        }
-
-        // Add other pages in a structured manner
-        for (path, content) in content_map.iter() {
-            if path != &root_path {
-                markdown.push_str(&format!("## {}\n\n", path));
-                markdown.push_str(content);
-                markdown.push_str("\n\n");
-            }
-        }
-
-        Ok(markdown)
+fn extract_description(html: &str) -> String {
+    if html.is_empty() {
+        return "No description available".to_string();
     }
+
+    let document = scraper::Html::parse_document(html);
+    
+    let meta_selector = scraper::Selector::parse("meta[name='description'], meta[property='og:description']").unwrap();
+    let description = document
+        .select(&meta_selector)
+        .next()
+        .and_then(|element| element.value().attr("content"))
+        .map(|content| content.trim().to_string());
+
+    if let Some(desc) = description {
+        if !desc.is_empty() {
+            return desc;
+        }
+    }
+
+    let p_selector = scraper::Selector::parse("p").unwrap();
+    document
+        .select(&p_selector)
+        .next()
+        .and_then(|element| element.text().next())
+        .map(|text| text.trim().to_string())
+        .unwrap_or_else(|| "No description available".to_string())
 }
